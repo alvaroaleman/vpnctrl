@@ -8,10 +8,12 @@ import (
 	"io/ioutil"
 	"net"
 	"os"
+	"os/exec"
 	"strconv"
 	"time"
 
 	"github.com/digitalocean/godo"
+	"github.com/vishvananda/netlink"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/crypto/ssh"
@@ -77,6 +79,15 @@ func main() {
 	if err := ioutil.WriteFile("/etc/wireguard/"+hostname+".conf", localCfgSerialized, 0600); err != nil {
 		log.Fatal("failed to write local wireguard config", zap.Error(err), zap.String("path", "/etc/wireguard/"+hostname+".conf"), zap.String("config", string(localCfgSerialized)))
 	}
+
+	if out, err := exec.Command("wg-quick", "up", hostname).CombinedOutput(); err != nil {
+		log.Fatal("failed to enable wireguard interface", zap.Error(err), zap.String("output", string(out)))
+	}
+
+	if err := setupRoutes(log, serverAddr); err != nil {
+		log.Fatal("failed to set up the routes", zap.Error(err))
+	}
+	log.Info("Successfully set up everything")
 }
 
 func generateLocalConfig() (cfg *types.WireguardConfig, serverPriv *wgtypes.Key, err error) {
@@ -225,4 +236,49 @@ func waitForServer(log *zap.Logger, addr string) error {
 			return nil
 		}
 	}
+}
+
+func setupRoutes(log *zap.Logger, ip string) error {
+	_, endpointNet, err := net.ParseCIDR(ip + "/32")
+	if err != nil {
+		return fmt.Errorf("failed to parse %s/32 as ip: %w", ip, err)
+	}
+	wgInternalIP := net.IPv4(172, 18, 6, 1)
+	currentRoutes, err := netlink.RouteList(nil, 4)
+	if err != nil {
+		return fmt.Errorf("failed to list routes: %w", err)
+	}
+	var hasWGServerRoute bool
+	var hasDefaultRouteThroughWg bool
+	var defaultGW net.IP
+	for _, route := range currentRoutes {
+		if route.Dst == nil {
+			if route.Gw.String() == wgInternalIP.String() {
+				hasDefaultRouteThroughWg = true
+			} else {
+				// We assume there is only one default route or two if the WG one was already set up
+				defaultGW = route.Gw[:]
+			}
+			continue
+		}
+		if route.Dst.String() == endpointNet.String() {
+			hasWGServerRoute = true
+		}
+	}
+
+	if !hasWGServerRoute {
+		if err := netlink.RouteAdd(&netlink.Route{Dst: endpointNet, Gw: defaultGW}); err != nil {
+			return fmt.Errorf("failed to add route: %w", err)
+		}
+		log.Info("Added route for wireguard endpoint", zap.String("dst", endpointNet.String()), zap.String("gw", defaultGW.String()))
+	}
+
+	if !hasDefaultRouteThroughWg {
+		if err := netlink.RouteAdd(&netlink.Route{Gw: wgInternalIP}); err != nil {
+			return fmt.Errorf("failed to add default route through Wireguard: %w", err)
+		}
+		log.Info("Added default route through wireguard", zap.String("gw", wgInternalIP.String()))
+	}
+
+	return nil
 }
